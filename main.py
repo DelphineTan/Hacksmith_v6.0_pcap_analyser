@@ -8,7 +8,11 @@ from scapy.all import rdpcap, Raw
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key")
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return render_template_string(ERROR_TEMPLATE, error_message="File too large. Maximum file size is 500MB."), 413
 
 UPLOAD_FORM = """
 <!DOCTYPE html>
