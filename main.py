@@ -20,18 +20,61 @@ UPLOAD_FORM = """
         input[type="file"] { margin: 10px 0; }
         button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
         button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .status { margin-top: 10px; padding: 10px; border-radius: 4px; display: none; }
+        .status.loading { display: block; background: #e3f2fd; color: #1565c0; }
+        .status.error { display: block; background: #ffebee; color: #c62828; }
     </style>
 </head>
 <body>
     <h1>PCAP Analysis Report Card</h1>
     <div class="upload-form">
         <h3>Upload a PCAP File for Analysis</h3>
-        <form action="/analyze" method="POST" enctype="multipart/form-data">
-            <input type="file" name="pcap_file" accept=".pcap,.pcapng" required>
+        <form id="uploadForm">
+            <input type="file" id="pcapFile" name="pcap_file" accept=".pcap,.pcapng" required>
             <br><br>
-            <button type="submit">Analyze PCAP</button>
+            <button type="submit" id="submitBtn">Analyze PCAP</button>
         </form>
+        <div id="status" class="status"></div>
     </div>
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const fileInput = document.getElementById('pcapFile');
+            const statusDiv = document.getElementById('status');
+            const submitBtn = document.getElementById('submitBtn');
+            
+            if (!fileInput.files || fileInput.files.length === 0) {
+                statusDiv.className = 'status error';
+                statusDiv.textContent = 'Please select a PCAP file first.';
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('pcap_file', fileInput.files[0]);
+            
+            submitBtn.disabled = true;
+            statusDiv.className = 'status loading';
+            statusDiv.textContent = 'Analyzing PCAP file... Please wait.';
+            
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const html = await response.text();
+                document.open();
+                document.write(html);
+                document.close();
+            } catch (error) {
+                statusDiv.className = 'status error';
+                statusDiv.textContent = 'Error uploading file: ' + error.message;
+                submitBtn.disabled = false;
+            }
+        });
+    </script>
 </body>
 </html>
 """
