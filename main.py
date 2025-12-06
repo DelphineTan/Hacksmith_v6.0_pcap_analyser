@@ -1,10 +1,10 @@
 import os
 import sys
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from flask import Flask, request, render_template_string
 
-from scapy.all import PcapReader, Raw
+from scapy.all import PcapReader, Raw, TCP, IP
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key")
@@ -91,19 +91,25 @@ REPORT_TEMPLATE = """
 <head>
     <title>PCAP Analysis Report Card</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-        h1, h2 { color: #333; }
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 50px auto; padding: 20px; }
+        h1, h2, h3 { color: #333; }
         .report-card { background: #f9f9f9; padding: 20px; border-radius: 8px; margin: 20px 0; }
         .section { margin: 20px 0; padding: 15px; background: white; border-radius: 4px; border-left: 4px solid #007bff; }
         .warning { border-left-color: #dc3545; background: #fff5f5; }
         .success { border-left-color: #28a745; background: #f5fff5; }
+        .info { border-left-color: #17a2b8; background: #e8f7f9; }
+        .alert { border-left-color: #ff9800; background: #fff8e1; }
         table { width: 100%; border-collapse: collapse; margin: 10px 0; }
         th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
         th { background: #f0f0f0; }
         .bold-warning { color: #dc3545; font-weight: bold; font-size: 1.1em; }
+        .bold-alert { color: #ff9800; font-weight: bold; font-size: 1.1em; }
         a { color: #007bff; text-decoration: none; }
         a:hover { text-decoration: underline; }
         .total-packets { font-size: 1.5em; color: #007bff; font-weight: bold; }
+        .narrative { font-size: 1.1em; line-height: 1.6; color: #555; padding: 15px; background: #e3f2fd; border-radius: 8px; margin: 15px 0; border-left: 4px solid #2196f3; }
+        .packet-nums { font-family: monospace; font-size: 0.9em; color: #666; word-break: break-all; }
+        .finding-item { margin: 10px 0; padding: 10px; background: #fafafa; border-radius: 4px; }
     </style>
 </head>
 <body>
@@ -111,6 +117,12 @@ REPORT_TEMPLATE = """
     <a href="/">&larr; Analyze Another File</a>
     
     <div class="report-card">
+        <!-- Beginner Narrative -->
+        <div class="section info">
+            <h2>What's Happening in This Traffic?</h2>
+            <p class="narrative">{{ narrative }}</p>
+        </div>
+        
         <div class="section">
             <h2>Summary</h2>
             <p>File: <strong>{{ filename }}</strong></p>
@@ -135,6 +147,44 @@ REPORT_TEMPLATE = """
                 </tr>
                 {% endfor %}
             </table>
+        </div>
+        
+        <!-- Intrusion & Exfiltration Alerts -->
+        <div class="section {% if enumeration_findings or exfiltration_findings %}alert{% else %}success{% endif %}">
+            <h2>Intrusion & Exfiltration Alerts</h2>
+            
+            {% if enumeration_findings %}
+            <h3>Port Sweep Detection</h3>
+            <p class="bold-alert">WARNING: Potential port scanning activity detected!</p>
+            {% for finding in enumeration_findings %}
+            <div class="finding-item">
+                <p><strong>Source IP:</strong> {{ finding.source_ip }}</p>
+                <p><strong>Target IP:</strong> {{ finding.dest_ip }}</p>
+                <p><strong>Unique Ports Scanned:</strong> {{ finding.port_count }}</p>
+                <p><strong>Packet Numbers:</strong> <span class="packet-nums">{{ finding.packet_numbers|join(', ') }}</span></p>
+            </div>
+            {% endfor %}
+            {% else %}
+            <p><strong>No port sweep activity detected.</strong></p>
+            {% endif %}
+            
+            <hr style="margin: 20px 0; border: none; border-top: 1px solid #ddd;">
+            
+            {% if exfiltration_findings %}
+            <h3>Data Exfiltration Detection</h3>
+            <p class="bold-alert">WARNING: Asymmetrical data flow detected - possible data exfiltration!</p>
+            {% for finding in exfiltration_findings %}
+            <div class="finding-item">
+                <p><strong>Source IP (Internal):</strong> {{ finding.source_ip }}</p>
+                <p><strong>Destination IP:</strong> {{ finding.dest_ip }}</p>
+                <p><strong>Outbound Bytes:</strong> {{ finding.outbound_bytes }}</p>
+                <p><strong>Inbound Bytes:</strong> {{ finding.inbound_bytes }}</p>
+                <p><strong>Ratio:</strong> {{ finding.ratio }}:1 (outbound to inbound)</p>
+            </div>
+            {% endfor %}
+            {% else %}
+            <p><strong>No suspicious data exfiltration patterns detected.</strong></p>
+            {% endif %}
         </div>
         
         <div class="section {% if password_count > 0 %}warning{% else %}success{% endif %}">
@@ -174,14 +224,141 @@ ERROR_TEMPLATE = """
 """
 
 
+def detect_enumeration(scan_data):
+    """
+    Detect Port Sweep attempts.
+    A port sweep is when a single source IP sends TCP SYN packets to multiple
+    different destination ports on the same destination IP.
+    
+    Args:
+        scan_data: dict of {(src_ip, dst_ip): {'ports': set(), 'packets': list()}}
+    
+    Returns:
+        List of findings with source IP, dest IP, and packet numbers
+    """
+    findings = []
+    threshold = 15
+    
+    for (src_ip, dst_ip), data in scan_data.items():
+        if len(data['ports']) > threshold:
+            findings.append({
+                'source_ip': src_ip,
+                'dest_ip': dst_ip,
+                'port_count': len(data['ports']),
+                'packet_numbers': sorted(data['packets'][:50])
+            })
+    
+    return findings
+
+
+def detect_exfiltration(flow_data):
+    """
+    Detect asymmetrical data flows that may indicate data exfiltration.
+    Looks for sessions where outbound bytes significantly exceed inbound bytes.
+    
+    Args:
+        flow_data: dict of {(src_ip, dst_ip): {'outbound': bytes, 'inbound': bytes}}
+    
+    Returns:
+        List of findings with source IP, dest IP, and byte ratio
+    """
+    findings = []
+    ratio_threshold = 50
+    min_outbound_bytes = 10000
+    
+    for (src_ip, dst_ip), data in flow_data.items():
+        outbound = data['outbound']
+        inbound = data['inbound']
+        
+        if outbound > min_outbound_bytes and inbound > 0:
+            ratio = outbound / inbound
+            if ratio > ratio_threshold:
+                findings.append({
+                    'source_ip': src_ip,
+                    'dest_ip': dst_ip,
+                    'outbound_bytes': outbound,
+                    'inbound_bytes': inbound,
+                    'ratio': round(ratio, 1)
+                })
+        elif outbound > min_outbound_bytes and inbound == 0:
+            findings.append({
+                'source_ip': src_ip,
+                'dest_ip': dst_ip,
+                'outbound_bytes': outbound,
+                'inbound_bytes': inbound,
+                'ratio': "Infinite (no inbound)"
+            })
+    
+    findings.sort(key=lambda x: x['outbound_bytes'], reverse=True)
+    return findings[:10]
+
+
+def generate_narrative(protocol_summary, destination_counts, total_packets):
+    """
+    Generate a beginner-friendly narrative describing the network traffic.
+    
+    Args:
+        protocol_summary: list of top protocols
+        destination_counts: Counter of destination IPs/hosts
+        total_packets: total number of packets analyzed
+    
+    Returns:
+        A human-readable paragraph describing the traffic
+    """
+    top_destinations = destination_counts.most_common(2)
+    
+    dest_str = ""
+    if len(top_destinations) >= 2:
+        dest_str = f"{top_destinations[0][0]} and {top_destinations[1][0]}"
+    elif len(top_destinations) == 1:
+        dest_str = top_destinations[0][0]
+    else:
+        dest_str = "various destinations"
+    
+    protocol_str = ""
+    if protocol_summary:
+        protocols = [p['name'] for p in protocol_summary[:2]]
+        if len(protocols) >= 2:
+            protocol_str = f"{protocols[0]} and {protocols[1]}"
+        elif len(protocols) == 1:
+            protocol_str = protocols[0]
+        else:
+            protocol_str = "various protocols"
+    else:
+        protocol_str = "various protocols"
+    
+    narrative = (
+        f"This capture contains {total_packets:,} packets of network traffic. "
+        f"The network primarily communicated with {dest_str} "
+        f"using {protocol_str} protocols. "
+    )
+    
+    if any(p['name'] == 'DNS' for p in protocol_summary):
+        narrative += "DNS queries were used to resolve domain names. "
+    
+    if any(p['name'] == 'TCP' for p in protocol_summary):
+        narrative += "TCP connections indicate web browsing, file transfers, or other application traffic. "
+    
+    if any(p['name'] == 'UDP' for p in protocol_summary):
+        narrative += "UDP traffic may include streaming, gaming, or DNS lookups. "
+    
+    return narrative
+
+
 def analyze_pcap_streaming(file_path, max_packets=100000):
     """
     Analyze PCAP file using streaming to avoid memory issues.
-    Returns: (total_packets, protocol_summary, password_count)
+    Collects all necessary data for protocol analysis and intrusion detection.
+    
+    Returns dict with all analysis results
     """
     protocol_counts = Counter()
+    destination_counts = Counter()
     password_count = 0
     total_packets = 0
+    
+    scan_data = defaultdict(lambda: {'ports': set(), 'packets': []})
+    flow_data = defaultdict(lambda: {'outbound': 0, 'inbound': 0})
     
     with PcapReader(file_path) as pcap_reader:
         for packet in pcap_reader:
@@ -205,6 +382,24 @@ def analyze_pcap_streaming(file_path, max_packets=100000):
             else:
                 protocol_counts['Other'] += 1
             
+            if packet.haslayer(IP):
+                src_ip = packet[IP].src
+                dst_ip = packet[IP].dst
+                
+                destination_counts[dst_ip] += 1
+                
+                if packet.haslayer(TCP):
+                    tcp_layer = packet[TCP]
+                    
+                    if tcp_layer.flags & 0x02 and not (tcp_layer.flags & 0x10):
+                        dst_port = tcp_layer.dport
+                        scan_data[(src_ip, dst_ip)]['ports'].add(dst_port)
+                        scan_data[(src_ip, dst_ip)]['packets'].append(total_packets)
+                    
+                    pkt_len = len(packet)
+                    flow_data[(src_ip, dst_ip)]['outbound'] += pkt_len
+                    flow_data[(dst_ip, src_ip)]['inbound'] += pkt_len
+            
             if packet.haslayer(Raw):
                 try:
                     payload = packet[Raw].load.decode('utf-8', errors='ignore').lower()
@@ -223,7 +418,18 @@ def analyze_pcap_streaming(file_path, max_packets=100000):
             'percentage': percentage
         })
     
-    return total_packets, protocol_summary, password_count
+    enumeration_findings = detect_enumeration(scan_data)
+    exfiltration_findings = detect_exfiltration(flow_data)
+    narrative = generate_narrative(protocol_summary, destination_counts, total_packets)
+    
+    return {
+        'total_packets': total_packets,
+        'protocol_summary': protocol_summary,
+        'password_count': password_count,
+        'enumeration_findings': enumeration_findings,
+        'exfiltration_findings': exfiltration_findings,
+        'narrative': narrative
+    }
 
 
 @app.route('/')
@@ -257,13 +463,13 @@ def analyze():
             tmp_path = tmp_file.name
         
         print(f"Saved to temp file, analyzing with streaming...", file=sys.stderr, flush=True)
-        total_packets, protocol_summary, password_count = analyze_pcap_streaming(tmp_path)
-        print(f"Analyzed {total_packets} packets", file=sys.stderr, flush=True)
+        results = analyze_pcap_streaming(tmp_path)
+        print(f"Analyzed {results['total_packets']} packets", file=sys.stderr, flush=True)
         
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         
-        if total_packets == 0:
+        if results['total_packets'] == 0:
             return render_template_string(ERROR_TEMPLATE, error_message="The uploaded PCAP file contains no packets.")
         
         print("Analysis complete!", file=sys.stderr, flush=True)
@@ -271,9 +477,12 @@ def analyze():
         return render_template_string(
             REPORT_TEMPLATE,
             filename=file.filename,
-            total_packets=total_packets,
-            protocol_summary=protocol_summary,
-            password_count=password_count
+            total_packets=results['total_packets'],
+            protocol_summary=results['protocol_summary'],
+            password_count=results['password_count'],
+            enumeration_findings=results['enumeration_findings'],
+            exfiltration_findings=results['exfiltration_findings'],
+            narrative=results['narrative']
         )
     
     except Exception as e:

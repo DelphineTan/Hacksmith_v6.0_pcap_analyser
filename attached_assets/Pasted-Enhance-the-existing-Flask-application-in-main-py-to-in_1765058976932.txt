@@ -1,0 +1,28 @@
+Enhance the existing Flask application in `main.py` to include advanced network intrusion detection and a beginner-friendly summary. The application must continue to use Scapy for packet analysis.
+
+**Required New Functions and Logic:**
+
+1.  **Enumeration Detection Function:**
+    * Create a function, `detect_enumeration(packets)`, that identifies **Port Sweep** attempts.
+    * Logic: Identify a single **Source IP** that sends a high volume (e.g., more than 15 unique packets) of **TCP SYN** packets to *multiple different destination ports* on the same **Destination IP** within a short time frame.
+    * Return a list of dictionary findings, including the **Source IP** and the **Packet Numbers** where the attempt was found.
+
+2.  **Data Exfiltration Detection Function:**
+    * Create a function, `detect_exfiltration(packets)`, that identifies highly **Asymmetrical Flow**.
+    * Logic: Iterate through all TCP sessions. Find any internal host where the ratio of **Outbound Bytes** to **Inbound Bytes** is significantly skewed (e.g., ratio > 50:1), indicating a large amount of data leaving the network.
+    * Return a list of findings, including the **Source IP**, the **Destination IP**, and the ratio of bytes transferred.
+
+3.  **Beginner Narrative Generation Function:**
+    * Create a function, `generate_narrative(results)`, that summarizes the primary activity.
+    * Logic: Identify the top 2 most frequent **Destination Websites/IPs** and the top protocol/service being used (e.g., HTTP, DNS).
+    * Return a single, short paragraph (the narrative) describing the overall traffic flow (e.g., "The network primarily communicated with Google and YouTube using HTTP and DNS protocols.").
+
+**Required Update to `/analyze` Route and `report.html`:**
+
+* **In `main.py`'s `/analyze` route:**
+    * Call all new analysis functions (`detect_enumeration`, `detect_exfiltration`, and `generate_narrative`).
+    * Add the results from these functions into the main `analysis_data` dictionary before rendering `report.html`.
+* **In `templates/report.html`:**
+    * Display the **Beginner Narrative** prominently at the top, perhaps in a `<p>` tag or blockquote.
+    * Create a new section labeled "Intrusion & Exfiltration Alerts."
+    * Under this section, clearly display the findings from the **Enumeration** and **Exfiltration** detections, listing the IP addresses and the corresponding packet numbers so a beginner knows exactly where to look.
