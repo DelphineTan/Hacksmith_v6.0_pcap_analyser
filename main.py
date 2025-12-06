@@ -4,7 +4,7 @@ import tempfile
 from collections import Counter
 from flask import Flask, request, render_template_string
 
-from scapy.all import rdpcap, Raw
+from scapy.all import PcapReader, Raw
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key")
@@ -174,62 +174,56 @@ ERROR_TEMPLATE = """
 """
 
 
-def get_protocol_summary(packets):
+def analyze_pcap_streaming(file_path, max_packets=100000):
     """
-    Function 1: Protocol Summary
-    Count total packets and list the top 3 most common protocols.
-    Check application-layer protocols (DNS) before transport-layer (TCP/UDP).
+    Analyze PCAP file using streaming to avoid memory issues.
+    Returns: (total_packets, protocol_summary, password_count)
     """
     protocol_counts = Counter()
+    password_count = 0
+    total_packets = 0
     
-    for packet in packets:
-        if packet.haslayer('DNS'):
-            protocol_counts['DNS'] += 1
-        elif packet.haslayer('ICMP'):
-            protocol_counts['ICMP'] += 1
-        elif packet.haslayer('ARP'):
-            protocol_counts['ARP'] += 1
-        elif packet.haslayer('TCP'):
-            protocol_counts['TCP'] += 1
-        elif packet.haslayer('UDP'):
-            protocol_counts['UDP'] += 1
-        elif packet.haslayer('IP'):
-            protocol_counts['IP (Other)'] += 1
-        else:
-            protocol_counts['Other'] += 1
+    with PcapReader(file_path) as pcap_reader:
+        for packet in pcap_reader:
+            total_packets += 1
+            
+            if total_packets > max_packets:
+                break
+            
+            if packet.haslayer('DNS'):
+                protocol_counts['DNS'] += 1
+            elif packet.haslayer('ICMP'):
+                protocol_counts['ICMP'] += 1
+            elif packet.haslayer('ARP'):
+                protocol_counts['ARP'] += 1
+            elif packet.haslayer('TCP'):
+                protocol_counts['TCP'] += 1
+            elif packet.haslayer('UDP'):
+                protocol_counts['UDP'] += 1
+            elif packet.haslayer('IP'):
+                protocol_counts['IP (Other)'] += 1
+            else:
+                protocol_counts['Other'] += 1
+            
+            if packet.haslayer(Raw):
+                try:
+                    payload = packet[Raw].load.decode('utf-8', errors='ignore').lower()
+                    if 'password' in payload:
+                        password_count += 1
+                except Exception:
+                    pass
     
-    total = len(packets)
     top_3 = protocol_counts.most_common(3)
-    
-    result = []
+    protocol_summary = []
     for name, count in top_3:
-        percentage = round((count / total) * 100, 1) if total > 0 else 0
-        result.append({
+        percentage = round((count / total_packets) * 100, 1) if total_packets > 0 else 0
+        protocol_summary.append({
             'name': name,
             'count': count,
             'percentage': percentage
         })
     
-    return result
-
-
-def security_check_passwords(packets):
-    """
-    Function 2: Security Check
-    Identify and count all packets containing "password" (case-insensitive) in payload.
-    """
-    password_count = 0
-    
-    for packet in packets:
-        if packet.haslayer(Raw):
-            try:
-                payload = packet[Raw].load.decode('utf-8', errors='ignore').lower()
-                if 'password' in payload:
-                    password_count += 1
-            except Exception:
-                pass
-    
-    return password_count
+    return total_packets, protocol_summary, password_count
 
 
 @app.route('/')
@@ -262,23 +256,15 @@ def analyze():
             file.save(tmp_file.name)
             tmp_path = tmp_file.name
         
-        print(f"Saved to temp file, reading packets...", file=sys.stderr, flush=True)
-        packets = rdpcap(tmp_path)
-        print(f"Read {len(packets)} packets", file=sys.stderr, flush=True)
+        print(f"Saved to temp file, analyzing with streaming...", file=sys.stderr, flush=True)
+        total_packets, protocol_summary, password_count = analyze_pcap_streaming(tmp_path)
+        print(f"Analyzed {total_packets} packets", file=sys.stderr, flush=True)
         
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         
-        total_packets = len(packets)
-        
         if total_packets == 0:
             return render_template_string(ERROR_TEMPLATE, error_message="The uploaded PCAP file contains no packets.")
-        
-        print("Analyzing protocols...", file=sys.stderr, flush=True)
-        protocol_summary = get_protocol_summary(packets)
-        
-        print("Checking for passwords...", file=sys.stderr, flush=True)
-        password_count = security_check_passwords(packets)
         
         print("Analysis complete!", file=sys.stderr, flush=True)
         
