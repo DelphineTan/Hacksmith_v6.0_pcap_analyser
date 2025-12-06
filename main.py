@@ -179,7 +179,7 @@ REPORT_TEMPLATE = """
                 <p><strong>Destination IP:</strong> {{ finding.dest_ip }}</p>
                 <p><strong>Outbound Bytes:</strong> {{ finding.outbound_bytes }}</p>
                 <p><strong>Inbound Bytes:</strong> {{ finding.inbound_bytes }}</p>
-                <p><strong>Ratio:</strong> {{ finding.ratio }}:1 (outbound to inbound)</p>
+                <p><strong>Ratio:</strong> {% if finding.ratio is string %}{{ finding.ratio }}{% else %}{{ finding.ratio }}:1 (outbound to inbound){% endif %}</p>
             </div>
             {% endfor %}
             {% else %}
