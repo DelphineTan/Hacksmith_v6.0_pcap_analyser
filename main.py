@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 from collections import Counter
 from flask import Flask, request, render_template_string
@@ -7,6 +8,7 @@ from scapy.all import rdpcap, Raw
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key")
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 
 UPLOAD_FORM = """
 <!DOCTYPE html>
@@ -235,6 +237,8 @@ def index():
 @app.route('/analyze', methods=['POST'])
 def analyze():
     """Handle file upload and perform PCAP analysis."""
+    print("Starting PCAP analysis...", file=sys.stderr, flush=True)
+    
     if 'pcap_file' not in request.files:
         return render_template_string(ERROR_TEMPLATE, error_message="No file uploaded. Please select a PCAP file.")
     
@@ -246,22 +250,33 @@ def analyze():
     if not file.filename.lower().endswith(('.pcap', '.pcapng')):
         return render_template_string(ERROR_TEMPLATE, error_message="Invalid file type. Please upload a .pcap or .pcapng file.")
     
+    tmp_path = None
     try:
+        print(f"Processing file: {file.filename}", file=sys.stderr, flush=True)
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pcap') as tmp_file:
             file.save(tmp_file.name)
             tmp_path = tmp_file.name
         
+        print(f"Saved to temp file, reading packets...", file=sys.stderr, flush=True)
         packets = rdpcap(tmp_path)
+        print(f"Read {len(packets)} packets", file=sys.stderr, flush=True)
         
-        os.unlink(tmp_path)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
         
         total_packets = len(packets)
         
         if total_packets == 0:
             return render_template_string(ERROR_TEMPLATE, error_message="The uploaded PCAP file contains no packets.")
         
+        print("Analyzing protocols...", file=sys.stderr, flush=True)
         protocol_summary = get_protocol_summary(packets)
+        
+        print("Checking for passwords...", file=sys.stderr, flush=True)
         password_count = security_check_passwords(packets)
+        
+        print("Analysis complete!", file=sys.stderr, flush=True)
         
         return render_template_string(
             REPORT_TEMPLATE,
@@ -272,10 +287,11 @@ def analyze():
         )
     
     except Exception as e:
-        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+        print(f"Error during analysis: {str(e)}", file=sys.stderr, flush=True)
+        if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         return render_template_string(ERROR_TEMPLATE, error_message=f"Error analyzing PCAP file: {str(e)}")
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
