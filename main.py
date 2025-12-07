@@ -416,41 +416,63 @@ def detect_enumeration(scan_data):
 def detect_exfiltration(flow_data):
     """
     Detect asymmetrical data flows that may indicate data exfiltration.
-    Looks for sessions where outbound bytes significantly exceed inbound bytes.
-    
-    Args:
-        flow_data: dict of {(src_ip, dst_ip): {'outbound': bytes, 'inbound': bytes}}
-    
-    Returns:
-        List of findings with source IP, dest IP, and byte ratio
+    flow_data is keyed by a canonical pair (ip_a, ip_b) with counters:
+      {'a_to_b': bytes, 'b_to_a': bytes}
+    We evaluate both directions and report whichever side shows suspicious outbound -> inbound ratio.
     """
     findings = []
     ratio_threshold = 50
     min_outbound_bytes = 10000
     
-    for (src_ip, dst_ip), data in flow_data.items():
-        outbound = data['outbound']
-        inbound = data['inbound']
-        
-        if outbound > min_outbound_bytes and inbound > 0:
-            ratio = outbound / inbound
-            if ratio > ratio_threshold:
+    for (ip_a, ip_b), data in flow_data.items():
+        a_to_b = data.get('a_to_b', 0)
+        b_to_a = data.get('b_to_a', 0)
+
+        # Check A -> B as potential exfiltration
+        if a_to_b > min_outbound_bytes:
+            inbound = b_to_a
+            if inbound > 0:
+                ratio = a_to_b / inbound
+                if ratio > ratio_threshold:
+                    findings.append({
+                        'source_ip': ip_a,
+                        'dest_ip': ip_b,
+                        'outbound_bytes': a_to_b,
+                        'inbound_bytes': inbound,
+                        'ratio': round(ratio, 1)
+                    })
+            else:
                 findings.append({
-                    'source_ip': src_ip,
-                    'dest_ip': dst_ip,
-                    'outbound_bytes': outbound,
+                    'source_ip': ip_a,
+                    'dest_ip': ip_b,
+                    'outbound_bytes': a_to_b,
                     'inbound_bytes': inbound,
-                    'ratio': round(ratio, 1)
+                    'ratio': "Infinite (no inbound)"
                 })
-        elif outbound > min_outbound_bytes and inbound == 0:
-            findings.append({
-                'source_ip': src_ip,
-                'dest_ip': dst_ip,
-                'outbound_bytes': outbound,
-                'inbound_bytes': inbound,
-                'ratio': "Infinite (no inbound)"
-            })
+
+        # Check B -> A as potential exfiltration
+        if b_to_a > min_outbound_bytes:
+            inbound = a_to_b
+            if inbound > 0:
+                ratio = b_to_a / inbound
+                if ratio > ratio_threshold:
+                    findings.append({
+                        'source_ip': ip_b,
+                        'dest_ip': ip_a,
+                        'outbound_bytes': b_to_a,
+                        'inbound_bytes': inbound,
+                        'ratio': round(ratio, 1)
+                    })
+            else:
+                findings.append({
+                    'source_ip': ip_b,
+                    'dest_ip': ip_a,
+                    'outbound_bytes': b_to_a,
+                    'inbound_bytes': inbound,
+                    'ratio': "Infinite (no inbound)"
+                })
     
+    # sort and return top results
     findings.sort(key=lambda x: x['outbound_bytes'], reverse=True)
     return findings[:10]
 
@@ -520,8 +542,9 @@ def analyze_pcap_streaming(file_path, max_packets=100000):
     total_packets = 0
     
     scan_data = defaultdict(lambda: {'ports': set(), 'packets': []})
-    flow_data = defaultdict(lambda: {'outbound': 0, 'inbound': 0})
-    
+    # Use a canonical pair key and track both directions
+    flow_data = defaultdict(lambda: {'a_to_b': 0, 'b_to_a': 0})
+
     with PcapReader(file_path) as pcap_reader:
         for packet in pcap_reader:
             total_packets += 1
@@ -547,6 +570,7 @@ def analyze_pcap_streaming(file_path, max_packets=100000):
             if packet.haslayer(IP):
                 src_ip = packet[IP].src
                 dst_ip = packet[IP].dst
+                pkt_len = len(packet)
                 
                 destination_counts[dst_ip] += 1
                 
@@ -558,10 +582,13 @@ def analyze_pcap_streaming(file_path, max_packets=100000):
                         scan_data[(src_ip, dst_ip)]['ports'].add(dst_port)
                         scan_data[(src_ip, dst_ip)]['packets'].append(total_packets)
                     
-                    pkt_len = len(packet)
-                    flow_data[(src_ip, dst_ip)]['outbound'] += pkt_len
-                    flow_data[(dst_ip, src_ip)]['inbound'] += pkt_len
-            
+                    # canonical pair (sorted) so we keep one flow record per pair and track direction
+                pair = tuple(sorted([src_ip, dst_ip]))
+                if src_ip == pair[0]:
+                    flow_data[pair]['a_to_b'] += pkt_len
+                else:
+                    flow_data[pair]['b_to_a'] += pkt_len
+                                        
             if packet.haslayer(Raw):
                 try:
                     payload = packet[Raw].load.decode('utf-8', errors='ignore').lower()
