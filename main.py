@@ -2,13 +2,51 @@ import os
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from flask import Flask, request, render_template_string
+import re
+import ipaddress
+from markupsafe import Markup, escape
+from flask import Flask, request, render_template_string, redirect
+import requests
 
 from scapy.all import PcapReader, Raw, TCP, IP
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key")
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+
+
+def _ip_link_filter(text):
+    """Convert IPv4 addresses in a string into clickable anchor tags.
+
+    Links open an external IP info page (ipinfo.io) in a new tab.
+    This returns a Markup object so it's safe to use directly in templates.
+    """
+    if not text:
+        return text
+
+    try:
+        s = str(text)
+    except Exception:
+        return text
+
+    # Escape the text first so any HTML is shown literally
+    escaped = escape(s)
+
+    # Simple IPv4 regex (matches 0-255.0-255.0-255.0-255 loosely)
+    ip_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+    def _repl(m):
+        ip = m.group(0)
+        # Link internally to the Flask route which will call osintPan.lookup_ip
+        url = f"/ip/{ip}"
+        return f'<a href="{escape(url)}" target="_blank" rel="noopener noreferrer">{escape(ip)}</a>'
+
+    linked = ip_re.sub(_repl, escaped)
+    return Markup(linked)
+
+
+# Register as a jinja filter
+app.jinja_env.filters['ip_link'] = _ip_link_filter
 
 @app.errorhandler(413)
 def request_entity_too_large(error):
@@ -120,7 +158,7 @@ REPORT_TEMPLATE = """
         <!-- Beginner Narrative -->
         <div class="section info">
             <h2>What's Happening in This Traffic?</h2>
-            <p class="narrative">{{ narrative }}</p>
+            <p class="narrative">{{ narrative|ip_link }}</p>
         </div>
         
         <div class="section">
@@ -158,8 +196,8 @@ REPORT_TEMPLATE = """
             <p class="bold-alert">WARNING: Potential port scanning activity detected!</p>
             {% for finding in enumeration_findings %}
             <div class="finding-item">
-                <p><strong>Source IP:</strong> {{ finding.source_ip }}</p>
-                <p><strong>Target IP:</strong> {{ finding.dest_ip }}</p>
+                <p><strong>Source IP:</strong> {{ finding.source_ip|ip_link }}</p>
+                <p><strong>Target IP:</strong> {{ finding.dest_ip|ip_link }}</p>
                 <p><strong>Unique Ports Scanned:</strong> {{ finding.port_count }}</p>
                 <p><strong>Packet Numbers:</strong> <span class="packet-nums">{{ finding.packet_numbers|join(', ') }}</span></p>
             </div>
@@ -175,8 +213,8 @@ REPORT_TEMPLATE = """
             <p class="bold-alert">WARNING: Asymmetrical data flow detected - possible data exfiltration!</p>
             {% for finding in exfiltration_findings %}
             <div class="finding-item">
-                <p><strong>Source IP (Internal):</strong> {{ finding.source_ip }}</p>
-                <p><strong>Destination IP:</strong> {{ finding.dest_ip }}</p>
+                <p><strong>Source IP (Internal):</strong> {{ finding.source_ip|ip_link }}</p>
+                <p><strong>Destination IP:</strong> {{ finding.dest_ip|ip_link }}</p>
                 <p><strong>Outbound Bytes:</strong> {{ finding.outbound_bytes }}</p>
                 <p><strong>Inbound Bytes:</strong> {{ finding.inbound_bytes }}</p>
                 <p><strong>Ratio:</strong> {% if finding.ratio is string %}{{ finding.ratio }}{% else %}{{ finding.ratio }}:1 (outbound to inbound){% endif %}</p>
@@ -219,6 +257,130 @@ ERROR_TEMPLATE = """
         <p>{{ error_message }}</p>
     </div>
     <p><a href="/">&larr; Go Back</a></p>
+</body>
+</html>
+"""
+
+
+RESULTS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OSINT Lookup Results for {{ ip }}</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            max-width: 900px; 
+            margin: 40px auto; 
+            padding: 20px;
+            background-color: #0d1117;
+            color: #e6edf3;
+        }
+        h1 { font-size: 32px; margin-bottom: 10px; }
+        a { color: #58a6ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+
+        details {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 10px 15px;
+            margin-bottom: 12px;
+        }
+
+        summary {
+            font-size: 18px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        pre {
+            background: #161b22;
+            padding: 10px;
+            border-radius: 6px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+        }
+
+        ul { margin-left: 20px; }
+        li { margin: 5px 0; }
+    </style>
+</head>
+<body>
+
+    <h1>🔎 OSINT Results for: {{ ip }} <a href="{{ streamlit_url }}" target="_blank" style="font-size:16px; margin-left:10px; color:#58a6ff; text-decoration:none;">🔗</a></h1>
+    <p><a href="/">&larr; Back to Analysis</a></p>
+    <p>
+        <a href="{{ streamlit_url }}" target="_blank" style="background:#58a6ff;color:#0d1117;padding:8px 12px;border-radius:6px;text-decoration:none;">Open in Streamlit</a>
+    </p>
+
+    {% if error %}
+        <div class="card" style="border-left: 4px solid #dc3545;">
+            <h2>Error</h2>
+            <p>{{ error }}</p>
+        </div>
+    {% else %}
+
+        <div class="card">
+            <h2>Summary</h2>
+            <p><strong>Type:</strong> {{ result.type }}</p>
+            <p><strong>Target:</strong> {{ result.target }}</p>
+        </div>
+
+        <div class="card">
+            <h2>Data</h2>
+
+            {% for key, val in result.data.items() %}
+                <details>
+                    <summary>{{ key }}</summary>
+                    <div style="padding:10px;">
+                    {% if val is mapping %}
+                        <ul>
+                        {% for k2, v2 in val.items() %}
+                            <li><strong>{{ k2 }}:</strong>
+                                {% if v2 is mapping or v2 is sequence and not v2 is string %}
+                                    <pre style="display:inline">{{ v2 | tojson(indent=2) }}</pre>
+                                {% else %}
+                                    {{ v2 }}
+                                {% endif %}
+                            </li>
+                        {% endfor %}
+                        </ul>
+                    {% elif val is sequence and not val is string %}
+                        <ul>
+                        {% for item in val %}
+                            <li>{{ item }}</li>
+                        {% endfor %}
+                        </ul>
+                    {% else %}
+                        <pre>{{ val }}</pre>
+                    {% endif %}
+                    </div>
+                </details>
+            {% endfor %}
+        </div>
+
+        {% if result.links %}
+        <div class="card">
+            <h2>Links</h2>
+            <ul>
+                {% for l in result.links %}
+                    <li><a href="{{ l }}" target="_blank">{{ l }}</a></li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+    {% endif %}
+
 </body>
 </html>
 """
@@ -490,6 +652,44 @@ def analyze():
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         return render_template_string(ERROR_TEMPLATE, error_message=f"Error analyzing PCAP file: {str(e)}")
+
+
+@app.route('/ip/<ip>')
+def ip_lookup(ip):
+    """Internal route that runs an OSINT IP lookup via osintPan.lookup_ip and shows results."""
+    # validate simple IPv4/IPv6
+    try:
+        ipaddress.ip_address(ip)
+    except Exception:
+        return render_template_string(RESULTS_TEMPLATE, ip=ip, error="Invalid IP address provided.", result=None)
+
+    try:
+        # Prefer redirecting to the original Streamlit UI so the osintPan template is preserved.
+        streamlit_host = os.environ.get('STREAMLIT_HOST', 'http://127.0.0.1:8501')
+        streamlit_url = f"{streamlit_host}/?q={ip}"
+
+        # quick check whether Streamlit server is up
+        try:
+            r = requests.get(streamlit_host, timeout=1)
+            if r.status_code == 200:
+                return redirect(streamlit_url)
+        except Exception:
+            # Streamlit not reachable; fall back to rendering results in Flask
+            pass
+
+        # Import here to avoid running Streamlit UI at import time
+        import osintPan
+
+        if not hasattr(osintPan, 'lookup_ip'):
+            return render_template_string(RESULTS_TEMPLATE, ip=ip, error="osintPan.lookup_ip not available.", result=None)
+
+        result = osintPan.lookup_ip(ip)
+
+        # Render the Flask fallback template and include the streamlit_url so template can show 'Open in Streamlit'
+        return render_template_string(RESULTS_TEMPLATE, ip=ip, error=None, result=result, streamlit_url=streamlit_url)
+
+    except Exception as e:
+        return render_template_string(RESULTS_TEMPLATE, ip=ip, error=f"Error running OSINT lookup: {e}", result=None)
 
 
 if __name__ == '__main__':
